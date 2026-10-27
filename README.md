@@ -13,9 +13,8 @@ QuantumLanguage/
 └── frontend/
 ```
 
-`resolveQrunPath()` looks for the built binary at `../compiler/qrun.exe` and
-`../compiler/build/qrun.exe` relative to this folder, or wherever `QRUN_PATH`
-points.
+`resolveQrunPath()` looks for the built binary at `QRUN_PATH`, then
+`bin/qrun.exe`, `../compiler/build/qrun.exe` and `../compiler/qrun.exe`.
 
 ## Requirements
 
@@ -45,14 +44,20 @@ All configuration is via environment variables (see `.env.example`):
 | `NODE_ENV` | `development` | Environment name, echoed by `/api/health` |
 | `ALLOWED_ORIGINS` | *(empty = allow all)* | Comma-separated list of allowed CORS origins |
 | `QRUN_PATH` | *(auto-detected)* | Absolute path to the `qrun` executable |
+| `QRUN_LAUNCHER` | *(empty)* | Program that runs `qrun.exe`, e.g. `wine` on Linux |
 | `EXEC_TIMEOUT_MS` | `10000` | Kill a running program after this many ms |
 | `MAX_CODE_LENGTH` | `20000` | Reject submissions with more characters than this |
+| `MAX_STDIN_LENGTH` | `65536` | Reject `stdin` longer than this |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window for `/api/execute` |
 | `RATE_LIMIT_MAX` | `20` | Max requests per window per IP |
 
-If `QRUN_PATH` isn't set, the server looks for `qrun.exe`/`qrun.bat` in, in order:
-the path from `QRUN_PATH`, `../QuantumLanguage/`, `../QuantumLanguage/build/`,
-and the backend folder itself.
+## Strict C/C++ vs. reflexive `.sa`
+
+`.cpp` and `.c` submissions run under `qrun --strict`: anything g++/gcc would
+reject — a missing `;`, `cout` without `std::`, an undeclared name, Python or
+JavaScript syntax — is a compile error with a gcc-style message, and the
+program never runs. Only `.sa` files get Quantum's reflexive mixed-syntax
+mode, where Python, JavaScript, Ruby and C++ can share one file.
 
 ## API
 
@@ -67,28 +72,76 @@ and the backend folder itself.
 Request body:
 
 ```json
-{ "ext": ".sa", "code": "print(\"hello\");" }
+{
+  "ext": ".cpp",
+  "code": "#include <iostream>\nint main() {\n    int a, b;\n    std::cin >> a >> b;\n    std::cout << a + b << std::endl;\n}\n",
+  "stdin": "3 4\n"
+}
 ```
 
-`ext` must be one of `.sa`, `.js`, `.py`, `.cpp`, `.c`. `code` is the raw source text
-(capped at `MAX_CODE_LENGTH` characters).
+`ext` must be one of `.sa`, `.js`, `.py`, `.rb`, `.cpp`, `.c`. `code` is the raw
+source text (capped at `MAX_CODE_LENGTH`). `stdin` is optional; the program
+reads it and then gets end-of-file.
 
-Response:
+Success:
 
 ```json
 {
   "success": true,
+  "stage": null,
+  "strict": true,
+  "exitCode": 0,
   "hasWarnings": false,
-  "output": "hello",
+  "output": "7",
   "error": null,
-  "compiledOutput": "hello",
+  "compiledOutput": "7",
   "compilerError": null
 }
 ```
 
-On failure, `success` is `false` and `error`/`compilerError` describe the
-problem (syntax error, execution timeout, missing compiler, etc). This
-endpoint is rate-limited per IP via `RATE_LIMIT_WINDOW_MS`/`RATE_LIMIT_MAX`.
+Compile error (the program did not run):
+
+```json
+{
+  "success": false,
+  "stage": "compile",
+  "strict": true,
+  "exitCode": 1,
+  "output": "",
+  "error": "script.cpp:5:5: error: expected ';' before 'cout'\n    5 |     cout << x << endl;\n      |     ^~~~",
+  "compilerError": "script.cpp:5:5: error: expected ';' before 'cout'\n    5 |     cout << x << endl;\n      |     ^~~~"
+}
+```
+
+Runtime error (it compiled, then failed): `stage` is `"runtime"`, `output`
+holds whatever it printed first, `error` its stderr, and `compilerError` is
+`null`. A timeout returns HTTP 504 with `error: "Execution timed out after
+…ms."`.
+
+`compiledOutput`/`compilerError` mirror `output`/`error` for older clients.
+This endpoint is rate-limited per IP via `RATE_LIMIT_WINDOW_MS`/`RATE_LIMIT_MAX`.
+
+```bash
+curl -X POST https://your-host/api/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"ext":".cpp","code":"#include <iostream>\nint main(){ std::cout << 42; }"}'
+```
+
+## Deploying
+
+`qrun.exe` is a Windows binary, but it only imports core system DLLs, so the
+included `Dockerfile` runs it under Wine on Linux. That image works on any
+Docker host (Render, Railway, Fly.io, a VPS, ...):
+
+```bash
+cp ../compiler/build/qrun.exe bin/qrun.exe   # refresh after each compiler build
+docker build -t quantum-backend .
+docker run -p 5000:5000 -e ALLOWED_ORIGINS=https://your-frontend.example quantum-backend
+```
+
+For a platform that builds from the git repo, `bin/qrun.exe` must be
+committed. On a Windows host, skip Docker: `npm ci --omit=dev && npm start`
+with `QRUN_PATH` pointing at `qrun.exe` and `QRUN_LAUNCHER` empty.
 
 ## Demo mode
 

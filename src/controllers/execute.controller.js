@@ -1,21 +1,31 @@
 const config = require("../config");
-const { runCode, stripAnsi, cleanSandboxPath } = require("../services/qrun.service");
+const {
+  runCode,
+  stripAnsi,
+  cleanSandboxPath,
+  splitStages,
+  isStrict,
+} = require("../services/qrun.service");
 const { handleKnownSamples, buildKnownSampleFallback } = require("../services/samples.service");
 
+function clean(text) {
+  return cleanSandboxPath(stripAnsi(text)) || "";
+}
+
 async function execute(req, res) {
-  const { ext: extension, code } = req.body || {};
+  const { ext: extension, code, stdin = "" } = req.body || {};
 
   if (!extension || !code) {
     return res.status(400).json({
       success: false,
-      error: "Missing required fields: 'extension' and 'code'.",
+      error: "Missing required fields: 'ext' and 'code'.",
     });
   }
 
-  if (typeof code !== "string" || typeof extension !== "string") {
+  if (typeof code !== "string" || typeof extension !== "string" || typeof stdin !== "string") {
     return res.status(400).json({
       success: false,
-      error: "'extension' and 'code' must be strings.",
+      error: "'ext', 'code' and 'stdin' must be strings.",
     });
   }
 
@@ -26,6 +36,13 @@ async function execute(req, res) {
     });
   }
 
+  if (stdin.length > config.MAX_STDIN_LENGTH) {
+    return res.status(413).json({
+      success: false,
+      error: `stdin exceeds maximum length of ${config.MAX_STDIN_LENGTH} characters.`,
+    });
+  }
+
   if (!config.ALLOWED_EXTENSIONS.includes(extension)) {
     return res.status(400).json({
       success: false,
@@ -33,19 +50,22 @@ async function execute(req, res) {
     });
   }
 
-  // Demo-mode shortcut for known frontend samples.
-  const immediateSampleResponse = handleKnownSamples(code);
-  if (immediateSampleResponse) {
-    return res.json(immediateSampleResponse);
+  // Demo-mode shortcut for the frontend's .sa samples. Never for C/C++,
+  // which must always go through the strict compiler.
+  if (extension === ".sa") {
+    const immediateSampleResponse = handleKnownSamples(code);
+    if (immediateSampleResponse) {
+      return res.json(immediateSampleResponse);
+    }
   }
 
-  const result = await runCode(code, extension);
+  const result = await runCode(code, extension, stdin);
 
   if (result.noBinary) {
     return res.status(500).json({
       success: false,
       error:
-        "Execution engine not found. Set QRUN_PATH or place qrun.exe in the backend root or in ../compiler.",
+        "Execution engine not found. Set QRUN_PATH or place qrun.exe in backend/bin or ../compiler/build.",
     });
   }
 
@@ -58,31 +78,56 @@ async function execute(req, res) {
 
   const { execError, stdout, stderr } = result;
 
-  if (execError && execError.killed) {
-    return res.status(504).json({
+  // A string code (ENOENT, EACCES, ...) means qrun never started.
+  if (execError && typeof execError.code === "string") {
+    console.error("Failed to start execution engine:", execError);
+    return res.status(500).json({
       success: false,
-      error: `Execution timed out after ${config.EXEC_TIMEOUT_MS}ms.`,
+      error: "Execution engine failed to start.",
     });
   }
 
-  const isSyntaxError = stdout.includes("[Syntax Error]") || stderr.includes("[Syntax Error]");
-  const isTypeWarning = stdout.includes("[StaticTypeWarning]");
+  const { compiled, compileLog, runtimeError } = splitStages(stderr);
+  const output = clean(stdout);
 
-  const cleanOutput = cleanSandboxPath(stripAnsi(stdout));
-  const cleanError = cleanSandboxPath(stripAnsi(stderr));
+  if (execError && execError.killed) {
+    return res.status(504).json({
+      success: false,
+      stage: compiled ? "runtime" : "compile",
+      strict: isStrict(extension),
+      exitCode: null,
+      output,
+      error: `Execution timed out after ${config.EXEC_TIMEOUT_MS}ms.`,
+      compiledOutput: output,
+      compilerError: null,
+    });
+  }
 
-  const fallback = buildKnownSampleFallback(code, cleanOutput, cleanError);
-  if (fallback) {
-    return res.json(fallback);
+  const exitCode = execError ? execError.code ?? 1 : 0;
+  const success = compiled && exitCode === 0;
+  const compilerError = compiled ? null : clean(compileLog) || "Compilation failed.";
+  const error = compiled ? clean(runtimeError) || null : compilerError;
+
+  if (extension === ".sa") {
+    const fallback = buildKnownSampleFallback(code, output, error || "");
+    if (fallback) {
+      return res.json(fallback);
+    }
   }
 
   res.json({
-    success: !execError && !isSyntaxError,
-    hasWarnings: isTypeWarning,
-    output: cleanOutput,
-    error: isSyntaxError && stdout ? cleanSandboxPath(stripAnsi(stdout)) : cleanError,
-    compiledOutput: cleanOutput,
-    compilerError: isSyntaxError && stdout ? cleanSandboxPath(stripAnsi(stdout)) : cleanError,
+    success,
+    // Where it failed: "compile" (rejected before running), "runtime"
+    // (compiled, then exited non-zero), or null on success.
+    stage: success ? null : compiled ? "runtime" : "compile",
+    strict: isStrict(extension),
+    exitCode,
+    hasWarnings:
+      compiled && (Boolean(clean(compileLog)) || stdout.includes("[StaticTypeWarning]")),
+    output,
+    error,
+    compiledOutput: output,
+    compilerError,
   });
 }
 

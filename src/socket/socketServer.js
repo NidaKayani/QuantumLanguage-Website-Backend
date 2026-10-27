@@ -3,7 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { resolveQrunPath } = require("../services/qrun.service");
+const config = require("../config");
+const { resolveQrunPath, buildCommand, STAGE_MARKER } = require("../services/qrun.service");
 
 let activeConnection = null;
 let activeProcess = null;
@@ -28,10 +29,9 @@ function setupWebSocket(server) {
 
                         // Execute directly - no intermediate status messages
                         const fileHash = crypto.randomBytes(8).toString('hex');
-                        const ALLOWED_EXTS = ['.sa', '.js', '.py', '.rb', '.cpp', '.c'];
-                        const ext = ALLOWED_EXTS.includes(data.ext) ? data.ext : '.sa';
+                        const ext = config.ALLOWED_EXTENSIONS.includes(data.ext) ? data.ext : '.sa';
 
-                        const tempFilePath = path.join(__dirname, '..', 'tmp', `sandbox_${fileHash}${ext}`);
+                        const tempFilePath = path.join(config.SANDBOX_DIR, `sandbox_${fileHash}${ext}`);
 
                         fs.writeFile(tempFilePath, data.payload, (err) => {
                             if (err) {
@@ -46,9 +46,8 @@ function setupWebSocket(server) {
                                 return;
                             }
 
-                            activeProcess = spawn(qrunPath, [tempFilePath]);
-                            
-                
+                            const { command, args } = buildCommand(qrunPath, ext, path.basename(tempFilePath));
+                            activeProcess = spawn(command, args, { cwd: config.SANDBOX_DIR });
 
                             activeProcess.stdout.on('data', (outputData) => {
                                 const text = outputData.toString().replace(/\n/g, '\r\n');
@@ -56,7 +55,11 @@ function setupWebSocket(server) {
                             });
 
                             activeProcess.stderr.on('data', (errorData) => {
-                                const text = errorData.toString().replace(/\n/g, '\r\n');
+                                // The stage marker is for the REST API; the terminal doesn't show it.
+                                const text = errorData.toString()
+                                    .replace(new RegExp(`${STAGE_MARKER.replace(/[[\]]/g, '\\$&')}\\r?\\n?`), '')
+                                    .replace(/\r?\n/g, '\r\n');
+                                if (!text) return;
                                 ws.send(JSON.stringify({ type: 'stderr', payload: text }));
                             });
 
