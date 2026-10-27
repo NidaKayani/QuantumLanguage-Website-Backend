@@ -3,17 +3,112 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { resolveQrunPath } = require("../services/qrun.service");
+const config = require("../config");
+const { resolveQrunPath, buildCommand, STAGE_MARKER } = require("../services/qrun.service");
 
-let activeConnection = null;
-let activeProcess = null;
+// The stage marker is for the API; the terminal never shows it.
+const MARKER_LINE = new RegExp(`${STAGE_MARKER.replace(/[[\]]/g, '\\$&')}\\r?\\n?`);
 
 function setupWebSocket(server) {
     const wss = new WebSocketServer({ server });
 
+    // Each connection runs at most one program at a time; connections are
+    // independent, so visitors never interrupt each other.
     wss.on('connection', (ws) => {
-        if (activeConnection) activeConnection.close();
-        activeConnection = ws;
+        let activeProcess = null;
+
+        const send = (message) => {
+            if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
+        };
+
+        // Ends the running program without reporting its exit (a newer run or
+        // the user replaced it).
+        const discardActive = () => {
+            if (!activeProcess) return;
+            const proc = activeProcess;
+            activeProcess = null;
+            proc.kill();
+        };
+
+        const run = (code, requestedExt, requestedName) => {
+            discardActive();
+
+            const ext = config.ALLOWED_EXTENSIONS.includes(requestedExt) ? requestedExt : '.sa';
+            const fileName = `sandbox_${crypto.randomBytes(8).toString('hex')}${ext}`;
+            const tempFilePath = path.join(config.SANDBOX_DIR, fileName);
+            // Diagnostics name the file as the user knows it (main.cpp:3:2),
+            // never the sandbox copy.
+            const baseName = typeof requestedName === 'string' ? path.basename(requestedName) : '';
+            const shownName = /^[\w.\- ]{1,100}$/.test(baseName) ? baseName : `script${ext}`;
+            const rename = (text) => text.split(fileName).join(shownName);
+
+            fs.writeFile(tempFilePath, typeof code === 'string' ? code : '', (err) => {
+                if (err) {
+                    send({ type: 'stderr', payload: 'System Error: Failed to allocate sandbox space.\r\n' });
+                    send({ type: 'process_completion', exitCode: null, stage: null });
+                    return;
+                }
+
+                const qrunPath = resolveQrunPath();
+                if (!qrunPath) {
+                    send({ type: 'stderr', payload: 'Execution engine (qrun) not found in backend.\r\n' });
+                    send({ type: 'process_completion', exitCode: null, stage: null });
+                    fs.unlink(tempFilePath, () => {});
+                    return;
+                }
+
+                const { command, args } = buildCommand(qrunPath, ext, fileName);
+                const proc = spawn(command, args, { cwd: config.SANDBOX_DIR });
+                activeProcess = proc;
+                let compiled = false;
+                let timedOut = false;
+
+                const timer = setTimeout(() => {
+                    timedOut = true;
+                    proc.kill();
+                }, config.WS_EXEC_TIMEOUT_MS);
+
+                proc.stdout.on('data', (chunk) => {
+                    if (activeProcess !== proc) return;
+                    send({ type: 'stdout', payload: rename(chunk.toString()).replace(/\r?\n/g, '\r\n') });
+                });
+
+                proc.stderr.on('data', (chunk) => {
+                    if (activeProcess !== proc) return;
+                    let text = chunk.toString();
+                    if (MARKER_LINE.test(text)) {
+                        compiled = true;
+                        text = text.replace(MARKER_LINE, '');
+                    }
+                    if (text) send({ type: 'stderr', payload: rename(text).replace(/\r?\n/g, '\r\n') });
+                });
+
+                proc.stdin.on('error', () => {});
+
+                proc.on('error', (spawnErr) => {
+                    console.error('Failed to start execution engine:', spawnErr);
+                });
+
+                proc.on('close', (exitCode) => {
+                    clearTimeout(timer);
+                    fs.unlink(tempFilePath, () => {});
+                    if (activeProcess !== proc) return;
+                    activeProcess = null;
+                    if (timedOut) {
+                        send({
+                            type: 'stderr',
+                            payload: `Execution timed out after ${config.WS_EXEC_TIMEOUT_MS / 1000}s.\r\n`,
+                        });
+                    }
+                    send({
+                        type: 'process_completion',
+                        exitCode,
+                        // Where it failed: "compile", "runtime", or null on success.
+                        stage: exitCode === 0 && !timedOut ? null : compiled ? 'runtime' : 'compile',
+                    });
+                });
+            });
+        };
 
         ws.on('message', (message) => {
             try {
@@ -21,64 +116,19 @@ function setupWebSocket(server) {
 
                 switch (data.type) {
                     case 'run':
-                        if (activeProcess) {
-                            activeProcess.kill();
-                            activeProcess = null;
-                        }
-
-                        // Execute directly - no intermediate status messages
-                        const fileHash = crypto.randomBytes(8).toString('hex');
-                        const ALLOWED_EXTS = ['.sa', '.js', '.py', '.rb', '.cpp', '.c'];
-                        const ext = ALLOWED_EXTS.includes(data.ext) ? data.ext : '.sa';
-
-                        const tempFilePath = path.join(__dirname, '..', 'tmp', `sandbox_${fileHash}${ext}`);
-
-                        fs.writeFile(tempFilePath, data.payload, (err) => {
-                            if (err) {
-                                ws.send(JSON.stringify({ type: 'stderr', payload: '\x1b[31mSystem Error: Failed to allocate sandbox space.\x1b[0m\r\n' }));
-                                return;
-                            }
-
-                            const qrunPath = resolveQrunPath();
-                            if (!qrunPath) {
-                                ws.send(JSON.stringify({ type: 'stderr', payload: '\x1b[31mExecution engine (qrun) not found in backend.\x1b[0m\r\n' }));
-                                fs.unlink(tempFilePath, () => {});
-                                return;
-                            }
-
-                            activeProcess = spawn(qrunPath, [tempFilePath]);
-                            
-                
-
-                            activeProcess.stdout.on('data', (outputData) => {
-                                const text = outputData.toString().replace(/\n/g, '\r\n');
-                                ws.send(JSON.stringify({ type: 'stdout', payload: text }));
-                            });
-
-                            activeProcess.stderr.on('data', (errorData) => {
-                                const text = errorData.toString().replace(/\n/g, '\r\n');
-                                ws.send(JSON.stringify({ type: 'stderr', payload: text }));
-                            });
-
-                            activeProcess.on('close', (code) => {
-                                fs.unlink(tempFilePath, () => {});
-                                activeProcess = null;
-                            });
-                        });
+                        run(data.payload, data.ext, data.name);
                         break;
 
                     case 'input':
-                        if (activeProcess && activeProcess.stdin) {
+                        if (activeProcess && activeProcess.stdin.writable && typeof data.payload === 'string') {
                             activeProcess.stdin.write(data.payload);
                         }
                         break;
 
                     case 'stop':
                         if (activeProcess) {
-                            activeProcess.kill();
-                            activeProcess = null;
-                            ws.send(JSON.stringify({ type: 'status', payload: '\x1b[31mProcess terminated by user.\x1b[0m' }));
-                            ws.send(JSON.stringify({ type: 'process_completion' }));
+                            discardActive();
+                            send({ type: 'process_completion', exitCode: null, stage: null, stopped: true });
                         }
                         break;
                 }
@@ -87,13 +137,7 @@ function setupWebSocket(server) {
             }
         });
 
-        ws.on('close', () => {
-            if (activeProcess) {
-                activeProcess.kill();
-                activeProcess = null;
-            }
-            if (activeConnection === ws) activeConnection = null;
-        });
+        ws.on('close', discardActive);
     });
 
     return wss;
