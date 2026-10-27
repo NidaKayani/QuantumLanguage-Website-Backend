@@ -46,6 +46,7 @@ All configuration is via environment variables (see `.env.example`):
 | `QRUN_PATH` | *(auto-detected)* | Absolute path to the `qrun` executable |
 | `QRUN_LAUNCHER` | *(empty)* | Program that runs `qrun.exe`, e.g. `wine` on Linux |
 | `EXEC_TIMEOUT_MS` | `10000` | Kill a running program after this many ms |
+| `WS_EXEC_TIMEOUT_MS` | `300000` | Same, for interactive IDE runs over the WebSocket |
 | `MAX_CODE_LENGTH` | `20000` | Reject submissions with more characters than this |
 | `MAX_STDIN_LENGTH` | `65536` | Reject `stdin` longer than this |
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate-limit window for `/api/execute` |
@@ -126,6 +127,19 @@ curl -X POST https://your-host/api/execute \
   -H 'Content-Type: application/json' \
   -d '{"ext":".cpp","code":"#include <iostream>\nint main(){ std::cout << 42; }"}'
 ```
+
+### WebSocket (the IDE terminal)
+
+Connect to `ws://host:PORT`. Each connection runs at most one program at a
+time, independently of other connections. Messages are JSON:
+
+| Direction | Message |
+| --- | --- |
+| → | `{ "type": "run", "ext": ".cpp", "payload": "<code>", "name": "main.cpp" }` (starting a run replaces the current one; `name` is used in compiler messages) |
+| → | `{ "type": "input", "payload": "Ada\n" }` — written to the program's stdin |
+| → | `{ "type": "stop" }` |
+| ← | `{ "type": "stdout" \| "stderr", "payload": "..." }` |
+| ← | `{ "type": "process_completion", "exitCode": 0, "stage": null }` — `stage` is `"compile"`, `"runtime"` or `null`; `"stopped": true` after a stop |
 
 ## Deploying
 

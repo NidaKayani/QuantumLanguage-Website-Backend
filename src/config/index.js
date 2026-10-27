@@ -10,6 +10,8 @@ const config = {
     .map((o) => o.trim())
     .filter(Boolean),
   EXEC_TIMEOUT_MS: Number(process.env.EXEC_TIMEOUT_MS) || 10000,
+  // Interactive IDE runs wait on the user's input, so they get longer.
+  WS_EXEC_TIMEOUT_MS: Number(process.env.WS_EXEC_TIMEOUT_MS) || 300000,
   MAX_CODE_LENGTH: Number(process.env.MAX_CODE_LENGTH) || 20000,
   MAX_STDIN_LENGTH: Number(process.env.MAX_STDIN_LENGTH) || 65536,
   // Optional program that runs qrun, e.g. "wine" when hosting qrun.exe on Linux.
